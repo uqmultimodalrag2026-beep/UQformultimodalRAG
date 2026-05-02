@@ -12,8 +12,6 @@ LeMUQ estimates uncertainty for multimodal retrieval augmented generation by com
 
 ![Overview of the LeMUQ pipeline](main.png)
 
-**Figure 1:** Overview of the LeMUQ pipeline. A VLM generates a response from the query, input image, and retrieved context. The response is re-evaluated under multiple conditioning settings to expose different uncertainty sources, and the resulting mapped token probabilities are passed to a finetuned LeMUQ model that estimates response confidence.
-
 ## Main Changes
 
 This fork extends TruthTorchLM for multimodal retrieval augmented generation and vision-language models.
