@@ -1,0 +1,1693 @@
+import copy
+import torch
+import numpy as np
+from tqdm import tqdm
+from typing import Union
+from datasets import Dataset
+from sklearn.model_selection import train_test_split
+
+from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+)
+from transformers import DebertaForSequenceClassification, DebertaTokenizer
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, LlavaForConditionalGeneration, BitsAndBytesConfig
+from .truth_method import TruthMethod
+from TruthTorchLM.utils import bidirectional_entailment_clustering
+from TruthTorchLM.templates import DEFAULT_SYSTEM_BENCHMARK_PROMPT, DEFAULT_USER_PROMPT, DEFAULT_LLAVA_PROMPT_NO_CONTEXT, DEFAULT_LLAVA_PROMPT_WITH_CONTEXT
+from .semantic_entropy import calculate_total_log
+
+from ..evaluators.correctness_evaluator import CorrectnessEvaluator
+from TruthTorchLM.utils.dataset_utils import get_dataset
+from ..generation_vlm import (
+    sample_generations_hf_local,
+    sample_generations_api,
+    sample_generations_batch_hf_local,
+    sample_generations_sequential_hf_local,
+)
+from TruthTorchLM.utils.eval_utils import metric_score
+from TruthTorchLM.utils.common_utils import fix_tokenizer_chat
+
+from TruthTorchLM.error_handler import handle_logprobs_error
+from TruthTorchLM.utils.common_utils import generate, fix_tokenizer_chat, split_after_subarray
+import math
+import os
+import pickle
+import json
+
+class LeMUQ_ablated(TruthMethod):
+
+    REQUIRES_LOGPROBS = True
+    REQUIRES_SAMPLED_TEXT = True
+    REQUIRES_SAMPLED_LOGPROBS = True
+
+    def __init__(
+        self,
+        device="cuda",
+        lars_model: PreTrainedModel = None,
+        lars_tokenizer: PreTrainedTokenizer = None,
+        model_path: str = None,
+        ue_type: str = "confidence",
+        number_of_generations: int = 0,
+        model_for_entailment: PreTrainedModel = None,
+        tokenizer_for_entailment: PreTrainedTokenizer = None,
+        entailment_model_device="cuda",
+        p_prime: bool = True, #all modalities
+        p_q_i: bool = True, #context removed
+        p_q_c: bool = True, #image removed
+        p_q: bool = True, #context and image removed
+        batch_generation:bool=True, #used only if ue_type is se or entropy
+        lars_with_context = False, #used to determine whether the whole context or just the question is given to the lars model
+        name = None
+    ):
+        super().__init__()
+        self.name = name
+        LeMUQ_ablated.lars_with_context = lars_with_context
+        self.lars_with_context = lars_with_context
+        self.p_prime = p_prime
+        self.p_q_c = p_q_c
+        self.p_q_i = p_q_i
+        self.p_q = p_q
+
+
+        assert ue_type in [
+            "confidence",
+            "semantic_entropy",
+            "se",
+            "entropy",
+        ], f"ue_type must be one of ['confidence', 'semantic_entropy', 'se', 'entropy'] but it is {ue_type}."
+        self.ue_type = ue_type
+        # number of generations for semantic entropy and entropy
+        self.number_of_generations = number_of_generations
+        self.batch_generation = batch_generation
+
+        # lars model
+        if model_path is not None:       
+            print(f"Loading LARS from: {model_path}")  
+            lars_model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
+            lars_tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        elif lars_model is None or lars_tokenizer is None:
+            lars_model = AutoModelForSequenceClassification.from_pretrained(
+                "duygunuryldz/LARS"
+            ).to(
+                device
+            )  # TODO
+            lars_tokenizer = AutoTokenizer.from_pretrained(
+                "duygunuryldz/LARS")  # TODO
+            #run once to have modified version of model and tokenizer
+            
+
+        self.lars_model = lars_model
+        self.lars_tokenizer = lars_tokenizer
+        self.device = device
+
+        # lars params
+        self.number_of_bins = (
+            lars_model.config.number_of_bins
+        )  # number of bins for discretization of the probability space
+        self.edges = (
+            lars_model.config.edges
+        )  # edges of bins, discretization of the probability space
+
+        # params for semantic entropy
+        if (ue_type == "se" or ue_type == "semantic_entropy") and (
+            model_for_entailment is None or tokenizer_for_entailment is None
+        ):
+            model_for_entailment = DebertaForSequenceClassification.from_pretrained(
+                "microsoft/deberta-large-mnli"
+            ).to(entailment_model_device)
+            tokenizer_for_entailment = DebertaTokenizer.from_pretrained(
+                "microsoft/deberta-large-mnli"
+            )
+            assert self.number_of_generations > 0, "Number of generations should be bigger that 0 if UE type is SE or Entropy"
+
+        self.model_for_entailment = model_for_entailment
+        self.tokenizer_for_entailment = tokenizer_for_entailment
+
+    @staticmethod
+    def _find_bin(value, edges, number_of_bins):
+        if edges is not None:
+            bin_index = np.digitize(value, edges, right=False)
+        else:
+            bin_index = int(
+                value * number_of_bins
+            )  # discretize the probability space equally
+        return min(bin_index, (number_of_bins - 1))
+
+
+    def prepare_answer_text(self, probs, answer_tokens, edges, number_of_bins):
+        a_text = ""
+
+        for i, tkn_text in enumerate(answer_tokens):
+            prob_idx = 0  # tracks position inside probs list
+            token_str = tkn_text
+
+            if self.p_prime:
+                base_bin = LeMUQ_ablated._find_bin(
+                    probs[prob_idx][i], edges, number_of_bins
+                )
+                token_str += f"[prob_token_{base_bin}]"
+                prob_idx += 1
+
+            if self.p_q_i:
+                img_no_ctx_bin = LeMUQ_ablated._find_bin(
+                    probs[prob_idx][i], edges, number_of_bins
+                )
+                token_str += f"[prob_token_img_no_ctx_{img_no_ctx_bin}]"
+                prob_idx += 1
+
+            if self.p_q_c:
+                no_img_ctx_bin = LeMUQ_ablated._find_bin(
+                    probs[prob_idx][i], edges, number_of_bins
+                )
+                token_str += f"[prob_token_no_img_ctx_{no_img_ctx_bin}]"
+                prob_idx += 1
+
+            if self.p_q:
+                no_img_no_ctx_bin = LeMUQ_ablated._find_bin(
+                    probs[prob_idx][i], edges, number_of_bins
+                )
+                token_str += f"[prob_token_no_img_no_ctx_{no_img_no_ctx_bin}]"
+                prob_idx += 1
+
+            a_text += token_str
+
+        return a_text
+    
+    @staticmethod
+    def tokenize_input(tokenizer, question, answer_text):
+
+        tokenized_input = tokenizer(
+            question,
+            answer_text,
+            add_special_tokens=True,  # Add '[CLS]' and '[SEP]'
+            return_token_type_ids=True,
+            is_split_into_words=False,  # ???
+            truncation=True,
+            max_length=None,
+            padding="max_length",
+        )
+        return tokenized_input
+    
+    def _identify_token_spans(
+    self,
+    tokens,
+    question,
+    probs,
+    instruction_length,
+    changed_eot,
+):
+        """
+        Identifies token index spans for:
+        CLS, context, question, instruction, answer, padding, separators
+        """
+
+        # --- tokenize question alone ---
+        q_enc = self.lars_tokenizer(
+            question,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        question_ids = q_enc["input_ids"]
+
+        cls_token = self.lars_tokenizer.cls_token      # <s>
+        sep_token = self.lars_tokenizer.sep_token      # </s>
+        pad_token = self.lars_tokenizer.pad_token      # <pad>
+
+        cls_idx = None
+        sep_indices = []
+        pad_indices = []
+
+        for i, tok in enumerate(tokens):
+            if tok == cls_token and cls_idx is None:
+                cls_idx = i
+            if tok == sep_token:
+                sep_indices.append(i)
+            if tok == pad_token:
+                pad_indices.append(i)
+
+        spans = {
+            "cls_idx": cls_idx,
+            "sep_indices": sep_indices,
+            "pad_start": pad_indices[0] if pad_indices else None,
+            "context_start": None,
+            "context_end": None,
+            "question_start": None,
+            "question_end": None,
+            "instruction_start": None,
+            "instruction_end": None,
+            "answer_start": None,
+            "answer_end": None,
+        }
+
+        # Expected RoBERTa layout:
+        # <s> context question instruction </s> </s> answer </s> <pad> ...
+
+        if len(sep_indices) >= 3:
+            context_question_start = cls_idx + 1
+            context_question_end = sep_indices[0] - instruction_length + 1
+
+            context_end = context_question_end - len(question_ids)
+            question_start = context_end
+            question_end = context_question_end
+
+            instruction_start = question_end
+            instruction_end = sep_indices[0]
+
+            answer_start = sep_indices[1] + 1
+            if changed_eot:
+                answer_end = answer_start + len(probs) * 2 + 7
+            else:
+                answer_end = answer_start + len(probs) * 2
+
+            spans.update({
+                "context_start": context_question_start,
+                "context_end": context_end,
+                "question_start": question_start,
+                "question_end": question_end,
+                "instruction_start": instruction_start,
+                "instruction_end": instruction_end,
+                "answer_start": answer_start,
+                "answer_end": answer_end,
+            })
+
+        return spans
+    
+    
+
+    def _normalized_entropy(self, values):
+        """
+        values: list or 1D tensor of attention values for a class
+        returns normalized entropy in [0, 1]
+        """
+        if len(values) <= 1:
+            return 0.0
+
+        eps = 1e-12
+        total = sum(values)
+
+        if total <= eps:
+            return 0.0
+
+        probs = [(v / total) + eps for v in values]
+        entropy = -sum(p * math.log(p) for p in probs)
+        return entropy / math.log(len(values))
+    
+    def _compute_cls_attention(self, output, spans, pkl_file=None, print_output=True):
+        """
+        Computes CLS → token attention (last layer),
+        aggregates by class, and either prints or writes to a pickle file.
+        
+        Args:
+            output: model output with attentions
+            spans: dict of token spans
+            pkl_file: str, optional path to .pkl file to store results
+            print_output: bool, whether to print the results
+        """
+        assert not (pkl_file is not None and print_output is False) or not (pkl_file is not None and print_output), \
+            "Only one of printing or writing to pkl should be used."
+
+        attentions = output.attentions  # tuple of layers
+        num_layers = len(attentions)
+
+        all_layers_data = []  # used only if saving to pkl
+
+        for layer_idx, layer_attn in enumerate(attentions):
+            cls_attn = layer_attn[0, :, spans["cls_idx"], :]  # (num_heads, seq_len)
+            cls_attn_mean = cls_attn.mean(dim=0)  # average over heads → (seq_len,)
+
+            # collect raw values per class
+            attn_values = {
+                "CLS": [],
+                "CTX": [],
+                "Q": [],
+                "INSTRCT": [],
+                "ANS": [],
+                "SEP": [],
+                "PAD": [],
+            }
+
+            for i, score in enumerate(cls_attn_mean.tolist()):
+                if i == spans["cls_idx"]:
+                    attn_values["CLS"].append(score)
+                elif spans["context_start"] <= i < spans["context_end"]:
+                    attn_values["CTX"].append(score)
+                elif spans["question_start"] <= i < spans["question_end"]:
+                    attn_values["Q"].append(score)
+                elif spans["instruction_start"] <= i < spans["instruction_end"]:
+                    attn_values["INSTRCT"].append(score)
+                elif spans["answer_start"] <= i < spans["answer_end"]:
+                    attn_values["ANS"].append(score)
+                elif i in spans["sep_indices"]:
+                    attn_values["SEP"].append(score)
+                elif spans["pad_start"] is not None and i >= spans["pad_start"]:
+                    attn_values["PAD"].append(score)
+
+            # Aggregate sum and entropy per class
+            layer_data = {}
+            total_mass = 0.0
+            for cls, values in attn_values.items():
+                cls_sum = sum(values)
+                cls_entropy = self._normalized_entropy(values)
+                total_mass += cls_sum
+                layer_data[cls] = {"sum": cls_sum, "entropy": cls_entropy}
+
+            layer_data["TOTAL"] = {"sum": total_mass, "entropy": None}
+            all_layers_data.append(layer_data)
+
+            # Print if requested
+            if print_output:
+                print(f"\n=== CLS → TOKEN CLASS ATTENTION (Layer {layer_idx+1}/{num_layers}) ===")
+                print(f"{'CLASS':8s} {'SUM':>10s} {'ENTROPY':>10s}")
+                for cls, metrics in layer_data.items():
+                    entropy = metrics["entropy"] if metrics["entropy"] is not None else 0.0
+                    print(f"{cls:8s} {metrics['sum']:10.4f} {entropy:10.4f}")
+
+        # Save to pickle if requested
+        if pkl_file is not None:
+            # Load existing data if the file exists
+            if os.path.exists(pkl_file):
+                with open(pkl_file, "rb") as f:
+                    existing_data = pickle.load(f)
+            else:
+                existing_data = []
+
+            existing_data.append(all_layers_data)
+
+            with open(pkl_file, "wb") as f:
+                pickle.dump(existing_data, f)
+    #for debugging
+    def _print_tokens_with_class(self, tokens, spans, input_ids_1d=None):
+        """
+        Print each token with its associated class label.
+        """
+        if input_ids_1d is None:
+            input_ids_1d = [self.lars_tokenizer.convert_tokens_to_ids(tok) for tok in tokens]
+
+        print("\n=== TOKENS WITH CLASS LABELS ===")
+        print(f"{'IDX':>3s} | {'TOKEN':>12s} | {'ID':>6s} | CLASS")
+        print("-" * 40)
+
+        for i, (tok, tok_id) in enumerate(zip(tokens, input_ids_1d)):
+            label = ""
+
+            if i == spans["cls_idx"]:
+                label = "CLS"
+            elif spans["answer_start"] is not None and spans["answer_start"] <= i < spans["answer_end"]:
+                label = "ANS"
+            elif i in spans["sep_indices"]:
+                label = "SEP"
+            elif spans["pad_start"] is not None and i >= spans["pad_start"]:
+                label = "PAD"
+            elif spans["context_start"] is not None:
+                if spans["context_start"] <= i < spans["context_end"]:
+                    label = "CTX"
+                elif spans["question_start"] <= i < spans["question_end"]:
+                    label = "Q"
+                elif spans["instruction_start"] <= i < spans["instruction_end"]:
+                    label = "INSTRCT"
+
+            print(f"{i:3d} | {tok:>12s} | {tok_id:6d} | {label}")
+
+
+
+
+    def _lars(self, question, full_text, generation_token_texts, probs, instruction_length = 12, change_to_eot = False, comp_att = False):
+        #Test: Replace the last EOS of generation tokens texts with eot token of roberta?. No need I think, no significant change
+        #print(generation_token_texts, probs)
+        changed = False
+        if change_to_eot:
+            for i, tok in enumerate(generation_token_texts):
+                if tok == '</s>':
+                    generation_token_texts[i] = '<|eot_id|>'
+                    changed = True
+        #Test end
+        a_text = self.prepare_answer_text(
+            probs, generation_token_texts, self.edges, self.number_of_bins
+        )
+        #print(a_text)
+        tokenized_input = LeMUQ_ablated.tokenize_input(
+            self.lars_tokenizer, full_text, a_text)
+        #print(tokenized_input)
+        input_ids = (
+            torch.tensor(tokenized_input["input_ids"]).reshape(
+                1, -1).to(self.device)
+        )
+
+        decoded_input = self.lars_tokenizer.decode(
+            input_ids[0],
+            skip_special_tokens=False
+        )
+        #print(decoded_input)
+
+        input_ids_1d = input_ids[0].tolist()
+        tokens = self.lars_tokenizer.convert_ids_to_tokens(input_ids_1d)
+
+        if comp_att:
+            spans = self._identify_token_spans(
+                tokens=tokens,
+                question=question,
+                probs=probs,
+                instruction_length=instruction_length,
+                changed_eot = changed
+            )
+
+        #self._print_tokens_with_class(tokens, spans, input_ids_1d=input_ids_1d)
+           
+        attention_mask = (
+            torch.tensor(tokenized_input["attention_mask"])
+            .reshape(1, -1)
+            .to(self.device)
+        )
+        token_type_ids = (
+            torch.tensor(tokenized_input["token_type_ids"])
+            .reshape(1, -1)
+            .to(self.device)
+        )
+        with torch.no_grad():
+            self.lars_model.eval()
+            output = self.lars_model(
+                input_ids, attention_mask=attention_mask, 
+                token_type_ids=token_type_ids,
+                output_attentions=True,
+                return_dict=True
+            )
+        logits = output.logits.detach()
+
+        if comp_att:
+            self._compute_cls_attention(output, spans, print_output=False, pkl_file="attentions.pkl")
+
+        output = torch.nn.functional.sigmoid(logits[:, 0]).item()
+        #print(output) #<-- scalar
+        return output
+    
+    @staticmethod
+    def _infer_probs_llava(model, generated_output, len_output):
+        outputs = model(**generated_output) 
+        logits = outputs.logits  # (1, seq_len, vocab)
+        len_input = logits[0].shape[0] - len_output
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        probs = probs[0, len_input-1:, :]
+        probs = torch.gather(
+            probs, dim=1, index=generated_output['input_ids'][0][len_input:].view(-1, 1) 
+        ) 
+        probs = probs.view(-1).tolist()
+        return probs
+    
+    @staticmethod
+    def _infer_probs_qwen(model, processor, messages_prompt_only, messages_answer):
+        # --- 2. Encode prompt-only ---
+
+        prompt_only_tokens = processor.apply_chat_template(
+            messages_prompt_only,
+            tokenize=True,
+            add_generation_prompt=True,  # assistant starts here
+            return_tensors="pt",
+            return_dict=True,
+        ).to(model.device)
+
+
+        messages_with_answer = messages_prompt_only + messages_answer
+
+        # --- 3. Encode prompt + answer ---
+        full_tokens = processor.apply_chat_template(
+            messages_with_answer,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_tensors="pt",
+            return_dict=True,
+        ).to(model.device)
+
+        # --- 4. Forward pass ---
+        with torch.no_grad():
+            outputs = model(**full_tokens)
+            logits = outputs.logits  # [1, seq_len, vocab]
+
+        # --- 5. Compute where the answer starts ---
+        len_input = prompt_only_tokens["input_ids"].shape[1]
+
+        # --- 6. Extract probabilities for answer tokens ---
+        probs = torch.softmax(logits, dim=-1)
+
+        answer_token_ids = full_tokens["input_ids"][0][len_input:]
+        answer_probs = probs[0, len_input - 1 :, :]
+        
+        token_probs = torch.gather(
+            answer_probs,
+            dim=1,
+            index=answer_token_ids.unsqueeze(-1),
+        ).squeeze(-1)
+
+        probs_list = token_probs.tolist()
+
+        # --- 7. Decode tokens (for LARS) ---
+        tokens_text = processor.tokenizer.batch_decode(
+            answer_token_ids, skip_special_tokens=False
+        )
+        return probs_list, tokens_text
+    
+    @staticmethod
+    def _generate_probs_conditions_llava(model, processor, all_ids, question, image, forward_hf = True):
+        """
+        generates the token probs in 4 conditions, use forward_hf when all_ids come from that method
+        """
+        model_output = all_ids.to(model.device) 
+
+
+        #img_ctx
+        target = torch.tensor([22933, 9047, 13566, 29901]).to("cuda")
+        tokens = split_after_subarray(output_ids=model_output , target=target) 
+        tokens_text = [processor.tokenizer.decode([token]) for token in tokens]
+        if forward_hf:
+            full_text = processor.batch_decode(model_output, skip_special_tokens=False)[0].split("\n")[1:] 
+        else:
+            full_text = processor.decode(model_output, skip_special_tokens=False).split("\n")[1:]        
+        
+        full_text = " ".join(full_text)
+        prompt = f"USER: <image>\n {full_text}"
+        generated_output = processor(text=prompt, images=image, return_tensors="pt").to(model.device)
+        #img_no_ctx
+        text_no_ctx = question + full_text.split(question)[1]
+        prompt_img_no_ctx = f"USER: <image>\n {text_no_ctx}"
+        generated_output_img_no_ctx = processor(text=prompt_img_no_ctx, images=image, return_tensors="pt").to(model.device)
+        #no_img_ctx
+        prompt_no_img_ctx = f"USER: {full_text}"
+        generated_output_no_img_ctx = processor(text=prompt_no_img_ctx, return_tensors="pt").to(model.device)
+        #no_img_no_ctx
+        prompt_no_img_no_ctx = f"USER: {text_no_ctx}"
+        generated_output_no_img_no_ctx = processor(text=prompt_no_img_no_ctx, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            #img_ctx, p_prime
+            probs = LeMUQ_ablated._infer_probs_llava(model, generated_output, tokens.shape[0])
+            #img_no_ctx, p_q_i
+            probs_img_no_ctx = LeMUQ_ablated._infer_probs_llava(model, generated_output_img_no_ctx, tokens.shape[0])
+            #no_img_ctx, p_q_c
+            probs_no_img_ctx = LeMUQ_ablated._infer_probs_llava(model, generated_output_no_img_ctx, tokens.shape[0])
+            #no_img_no_ctx p_q
+            probs_no_img_no_ctx = LeMUQ_ablated._infer_probs_llava(model, generated_output_no_img_no_ctx, tokens.shape[0])
+            #combine all probs
+            probs_combined = (probs, probs_img_no_ctx, probs_no_img_ctx, probs_no_img_no_ctx)
+        return probs_combined, tokens_text, full_text
+    
+    @staticmethod
+    def extract_between(text, start, end):
+        start_idx = text.index(start) + len(start)
+        end_idx = text.index(end, start_idx)
+        return text[start_idx:end_idx]
+
+    @staticmethod
+    def _generate_probs_conditions_qwen(model, processor, all_ids, input_text, question, generated_text, image, forward_hf = True):
+        if forward_hf:
+            tokenizer = processor.tokenizer
+            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(
+            model.device
+            )
+            #model_output = all_ids.to(model.device)
+            #tokens = model_output[0][len(input_ids[0]):]
+            question_text = tokenizer.batch_decode(input_ids)
+            question_and_context = LeMUQ_ablated.extract_between(question_text[0], "<|vision_end|>", "<|im_end|>") #everything between vision end and im_end
+            question_and_instruct = question + " Answer with a single word or a short sentence."
+        else:
+            question_and_context = input_text
+            question_and_instruct = input_text.split("\n")[-1]
+
+        answer_message = [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": generated_text}],
+            },
+        ]
+
+        messages_prompt_img_context = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": question_and_context},
+                ],
+            }
+        ]
+
+        messages_prompt_img_no_context = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": question_and_instruct}, 
+                ],
+            }
+        ]
+
+        messages_prompt_no_img_context = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question_and_context},
+                ],
+            }
+        ]
+
+        messages_prompt_no_img_no_context = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question_and_instruct},
+                ],
+            }
+        ]
+
+        
+        #full message (#img_ctx)
+        probs, tokens_text = LeMUQ_ablated._infer_probs_qwen(model, processor, messages_prompt_img_context, answer_message)
+        #img_no_ctx 
+        probs_img_no_ctx , _ = LeMUQ_ablated._infer_probs_qwen(model, processor, messages_prompt_img_no_context, answer_message)
+        #no_img_ctx 
+        probs_no_img_ctx , _ = LeMUQ_ablated._infer_probs_qwen(model, processor, messages_prompt_no_img_context, answer_message)
+        #no_img_no_ctx
+        probs_no_img_no_ctx , _ = LeMUQ_ablated._infer_probs_qwen(model, processor, messages_prompt_no_img_no_context, answer_message)
+
+        
+        #ToDo: Refactor this in a new method
+        probs_combined = (probs, probs_img_no_ctx, probs_no_img_ctx, probs_no_img_no_ctx)
+        return probs_combined, tokens_text, question_and_context 
+
+        
+    def filter_probs(self,probs_all):
+        probs_filtered = []
+        if self.p_prime:
+            probs_filtered.append(probs_all[0])
+        if self.p_q_i:
+            probs_filtered.append(probs_all[1])
+        if self.p_q_c:
+            probs_filtered.append(probs_all[2])
+        if self.p_q:
+            probs_filtered.append(probs_all[3])
+        probs_filtered = tuple(probs_filtered)   
+        return probs_filtered
+        
+    
+    def forward_hf_local(
+        self,
+        model: PreTrainedModel,
+        input_text: str,
+        generated_text: str,
+        question: str,
+        all_ids: Union[list, torch.Tensor],
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = None,
+        generation_seed=None,
+        sampled_generations_dict: dict = None,
+        processor = None,
+        image = None,
+        messages: list = [],
+        context: str = "",
+        **kwargs,
+    ):
+        if self.ue_type == "confidence":
+            if "llava" in model.config._name_or_path: 
+                probs_combined, tokens_text, full_text = self._generate_probs_conditions_llava(model, processor, all_ids, question, image)
+                probs_combined = self.filter_probs(probs_combined)  
+                with torch.no_grad():
+                    if self.lars_with_context:
+                        lars_score = self._lars(question, full_text.split(" ASSISTANT")[0], tokens_text, probs_combined) #with context
+                    else:
+                        lars_score = self._lars(question, question, tokens_text, probs_combined) #without context
+            if "Qwen" in model.config._name_or_path: 
+                probs_combined, tokens_text, full_text = self._generate_probs_conditions_qwen(model, processor, all_ids, input_text, question,generated_text, image)
+                probs_combined = self.filter_probs(probs_combined)
+                print(probs_combined) 
+                with torch.no_grad():
+                    if self.lars_with_context:
+                        lars_score = self._lars(question, full_text, tokens_text, probs_combined) #with context
+                    else:
+                        lars_score = self._lars(question, question, tokens_text, probs_combined) #without context
+
+        else:
+            raise RuntimeError("Only Confidence is allowed!")
+
+        return {
+            "truth_value": lars_score,
+            "generated_text": generated_text,
+        }  # we shouldn't return generated text. remove it from the output format
+
+    @handle_logprobs_error
+    def forward_api(
+        self,
+        model: str,
+        messages: list,
+        generated_text: str,
+        question: str,
+        generation_seed=None,
+        sampled_generations_dict: dict = None,
+        logprobs: list = None,
+        generated_tokens: list = None,
+        context: str = "",
+        **kwargs,
+    ):
+
+        if self.ue_type == "confidence":
+            lars_score = self._lars(
+                question, generated_tokens, torch.exp(
+                    torch.tensor(logprobs))
+            )
+
+        elif self.ue_type in ["semantic_entropy", "se", "entropy"]:
+            if sampled_generations_dict is None:
+                sampled_generations_dict = sample_generations_api(
+                    model=model,
+                    messages=messages,
+                    generation_seed=generation_seed,
+                    number_of_generations=self.number_of_generations,
+                    return_text=True,
+                    return_logprobs=True,
+                    **kwargs,
+                )
+            scores = []
+            generated_outputs = []
+            generated_texts = sampled_generations_dict["generated_texts"][
+                : self.number_of_generations
+            ]
+
+            for i in range(self.number_of_generations):
+                score = torch.log(
+                    torch.tensor(self._lars(
+                        question,
+                        sampled_generations_dict["tokens"][i],
+                        torch.exp(torch.tensor(sampled_generations_dict["logprobs"][i])),
+                    ))
+                ).item()
+                scores.append(score)  # scores are in log scale
+                generated_outputs.append((generated_texts[i], score))
+
+            if self.ue_type == "semantic_entropy" or self.ue_type == "se":
+                clusters = bidirectional_entailment_clustering(
+                    self.model_for_entailment,
+                    self.tokenizer_for_entailment,
+                    question,
+                    sampled_generations_dict["generated_texts"],
+                )
+                lars_score = -calculate_total_log(generated_outputs, clusters)
+                return {
+                    "truth_value": lars_score,
+                    "score_for_each_generation": scores,
+                    "generated_texts": generated_texts,
+                    "clusters": clusters,
+                }
+            elif self.ue_type == "entropy":
+                lars_score = np.sum(scores) / len(scores)
+                return {
+                    "truth_value": lars_score,
+                    "score_for_each_generation": scores,
+                    "generated_texts": generated_texts,
+                }
+
+        return {
+            "truth_value": lars_score,
+            "generated_text": generated_text,
+        }  # we shouldn't return generated text. remove it from the output format
+
+    @staticmethod
+    def _get_datasets(
+        datasets: list, size_for_each_dataset: list, val_ratio: float, seed: int, context_mode = None, dataset_csv=None, dataset_path=None, image_directory=None, retrieval_file=None, kb_path = None,
+    ):
+        print("Creating train and validation datasets...")
+        all_data = []
+        for i, dataset in enumerate(datasets):
+            all_data.append(
+                get_dataset(
+                    dataset,
+                    size_of_data=size_for_each_dataset[i],
+                    seed=seed,
+                    split="train",
+                    context_mode = context_mode,
+                    dataset_csv=dataset_csv,
+                    dataset_path=dataset_path,
+                    kb_path=kb_path,
+                    image_directory=image_directory,
+                    retrieval_file = retrieval_file
+                )
+            )
+
+        all_data = sum(
+            all_data, []
+        )  # list of dict, each dict contains "question" and "ground_truths"
+        train_data, val_data = train_test_split(
+            all_data, test_size=val_ratio, random_state=seed
+        )
+        return train_data, val_data
+    
+    @staticmethod
+    def drop_negative_mismatch_generations(train_data, val_data, verbose=True):
+        """
+        Remove token/probability length mismatches.
+
+        Train format:
+            - entry["token_texts"] -> list of generated token lists
+            - entry["probs"]       -> list of tuples, one tuple per generation
+            - if one generation mismatches, only that generation is removed
+
+        Val format:
+            - entry["token_texts"] -> single token list
+            - entry["probs"]       -> list with one tuple of 4 prob lists
+            - if any mismatch exists, the whole entry is removed
+        """
+        cleaned_train = []
+        cleaned_val = []
+
+        # ---------- train ----------
+        for entry_idx, entry in enumerate(train_data):
+            probs = entry.get("probs")
+            token_texts = entry.get("token_texts")
+
+            if not isinstance(probs, list) or not isinstance(token_texts, list):
+                cleaned_train.append(entry)
+                continue
+
+            keep_gen_indices = []
+
+            max_len = min(len(probs), len(token_texts))
+            for gen_idx in range(max_len):
+                tokens = token_texts[gen_idx]
+                prob_group = probs[gen_idx]
+
+                # expected: tokens=list, prob_group=tuple/list of 4 lists
+                if not isinstance(tokens, list) or not isinstance(prob_group, (tuple, list)):
+                    continue
+
+                token_len = len(tokens)
+                mismatch = False
+
+                for sub_idx, sublist in enumerate(prob_group):
+                    if not isinstance(sublist, list):
+                        mismatch = True
+                        break
+
+                    if len(sublist) != token_len:
+                        mismatch = True
+                        break
+
+                if not mismatch:
+                    keep_gen_indices.append(gen_idx)
+
+            if keep_gen_indices:
+                new_entry = dict(entry)
+                new_entry["token_texts"] = [token_texts[i] for i in keep_gen_indices]
+                new_entry["probs"] = [probs[i] for i in keep_gen_indices]
+
+                # keep generated_texts / labels aligned if present
+                if isinstance(entry.get("generated_texts"), list):
+                    new_entry["generated_texts"] = [entry["generated_texts"][i] for i in keep_gen_indices]
+                if isinstance(entry.get("labels"), list):
+                    new_entry["labels"] = [entry["labels"][i] for i in keep_gen_indices]
+
+                cleaned_train.append(new_entry)
+
+
+        # ---------- val ----------
+        for entry_idx, entry in enumerate(val_data):
+            probs = entry.get("probs")
+            tokens = entry.get("token_texts")
+
+            # val token_texts should be one token list, probs should usually be [tuple_of_4_lists]
+            if not isinstance(tokens, list) or not isinstance(probs, list) or len(probs) == 0:
+                continue
+
+            prob_group = probs[0]
+            if not isinstance(prob_group, (tuple, list)):
+                continue
+
+            token_len = len(tokens)
+            mismatch = False
+
+            for sub_idx, sublist in enumerate(prob_group):
+                if not isinstance(sublist, list):
+                    mismatch = True
+                    break
+
+                if len(sublist) != token_len:
+                    mismatch = True
+                    break
+
+            if mismatch:
+                continue
+
+            cleaned_val.append(entry)
+
+        print(
+            f"Finished mismatch cleanup: "
+            f"train {len(train_data)} -> {len(cleaned_train)}, "
+            f"val {len(val_data)} -> {len(cleaned_val)}"
+        )
+
+        return cleaned_train, cleaned_val
+
+
+    def _generate_answers_and_label(
+        self,
+        train_data: list,
+        val_data: list,
+        model: PreTrainedModel,
+        processor: AutoProcessor,
+        correctness_evaluator: CorrectnessEvaluator,
+        previous_context: list = [
+            {"role": "system", "content": DEFAULT_SYSTEM_BENCHMARK_PROMPT}
+        ],
+        user_prompt: str = DEFAULT_LLAVA_PROMPT_NO_CONTEXT,
+        num_gen_per_question: int = 5,
+        **kwargs,
+    ):
+        text = ""
+        print("Generating answers and labels for training data...")
+        for i in tqdm(range(len(train_data))):
+            question=train_data[i]["question"]
+            context=train_data[i]["context"]
+            image = train_data[i]["image"]
+
+            if "{context}" in user_prompt:
+                prompt = user_prompt.format(question=question, context = context)
+            else: 
+                prompt = user_prompt.format(question=question)
+            if LeMUQ_ablated.lars_with_context:
+                full_text = prompt.split("\n")[1:]
+                train_data[i]["question"] = "".join(full_text)
+            if "Qwen" in model.config._name_or_path:
+                messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+                ]
+                input = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+                ).to(model.device)
+                kwargs = copy.deepcopy(kwargs)
+                kwargs['max_new_tokens'] = 128
+            else:
+                input = processor(
+                text=prompt,
+                images = image,
+                return_tensors="pt"
+                ).to(model.device)
+            sampled = sample_generations_batch_hf_local(
+                model=model,
+                input=input,
+                input_text=text,
+                processor=processor,
+                number_of_generations=num_gen_per_question - 1,
+                return_text=True,
+                return_logprobs=True,
+                return_model_output=True,
+                temperature = 1.5,
+                **kwargs,
+            )
+
+            probs_combined_sampled = []
+            for k in range(sampled["model_outputs"].shape[0]):
+                if "Qwen" in model.config._name_or_path:
+                    probs, _, full_text = LeMUQ_ablated._generate_probs_conditions_qwen(model, processor, sampled["model_outputs"][k], prompt, question, sampled['generated_texts'][k], image, forward_hf=False) #(self, model, processor, all_ids, input_text, question, generated_text, image, forward_hf = True)
+                    probs = self.filter_probs(probs)
+                else:
+                    probs, _, full_text = LeMUQ_ablated._generate_probs_conditions_llava(model, processor, sampled["model_outputs"][k], question, image, forward_hf=False)
+                    probs = self.filter_probs(probs)
+                probs_combined_sampled.append(probs)
+
+            most_likely = sample_generations_sequential_hf_local(
+                model,
+                input=input,
+                input_text=text,
+                tokenizer=processor.tokenizer,
+                number_of_generations=1,
+                do_sample=False,
+                return_text=True,
+                return_logprobs=True,
+                return_model_output=True,
+                top_p=1,
+                temperature=None,
+                **kwargs,
+            )
+            if "Qwen" in model.config._name_or_path:
+                probs_combined_most_likely, _ , full_text= LeMUQ_ablated._generate_probs_conditions_qwen(model, processor, most_likely["model_outputs"][0][0], prompt, question, most_likely['generated_texts'][0], image, forward_hf=False)
+                probs_combined_most_likely = self.filter_probs(probs_combined_most_likely)
+                train_data[i]["generated_texts"] = most_likely["generated_texts"]
+                train_data[i]["probs"] = [
+                    probs_combined_most_likely#.tolist()
+                    #np.exp(most_likely["logprobs"][0]).tolist()
+                    ]
+                train_data[i]["token_texts"] = [
+                    [processor.decode(token) for token in most_likely["tokens"][0]]+ ['\n']
+                ]
+                for j in range(len(sampled["generated_texts"])):
+                    if sampled["generated_texts"][j] in train_data[i]["generated_texts"]:
+                        continue
+                    train_data[i]["generated_texts"].append(
+                        sampled["generated_texts"][j])
+                    train_data[i]["probs"].append(
+                        probs_combined_sampled[j]#.tolist()
+                        #np.exp(sampled["logprobs"][j]).tolist()
+                    )
+                    train_data[i]["token_texts"].append(
+                        [processor.decode([token])
+                        for token in sampled["tokens"][j]] + ['\n']
+                    )
+                train_data[i]["labels"] = [
+                    correctness_evaluator(
+                        train_data[i]["question"], answer, train_data[i]["ground_truths"]
+                    )
+                    for answer in train_data[i]["generated_texts"]
+                ]
+            else:
+                probs_combined_most_likely, _ , full_text= LeMUQ_ablated._generate_probs_conditions_llava(model, processor, most_likely["model_outputs"][0][0], question, image, forward_hf=False)
+                probs_combined_most_likely = self.filter_probs(probs_combined_most_likely)
+                train_data[i]["generated_texts"] = most_likely["generated_texts"]
+                train_data[i]["probs"] = [
+                    probs_combined_most_likely#.tolist()
+                    #np.exp(most_likely["logprobs"][0]).tolist()
+                    ]
+                train_data[i]["token_texts"] = [
+                    [processor.decode(token) for token in most_likely["tokens"][0]]
+                ]
+                for j in range(len(sampled["generated_texts"])):
+                    if sampled["generated_texts"][j] in train_data[i]["generated_texts"]:
+                        continue
+                    train_data[i]["generated_texts"].append(
+                        sampled["generated_texts"][j])
+                    train_data[i]["probs"].append(
+                        probs_combined_sampled[j]#.tolist()
+                        #np.exp(sampled["logprobs"][j]).tolist()
+                    )
+                    train_data[i]["token_texts"].append(
+                        [processor.decode([token])
+                        for token in sampled["tokens"][j]]
+                    )
+                train_data[i]["labels"] = [
+                    correctness_evaluator(
+                        train_data[i]["question"], answer, train_data[i]["ground_truths"]
+                    )
+                    for answer in train_data[i]["generated_texts"]
+                ]
+
+        print("Generating answers and labels for validation data...")
+        for i in tqdm(range(len(val_data))):
+            question=val_data[i]["question"]
+            context=val_data[i]["context"]
+            image = val_data[i]["image"]
+            if "{context}" in user_prompt:
+                prompt = user_prompt.format(question=question, context = context)
+            else: 
+                prompt = user_prompt.format(question=question)
+            if LeMUQ_ablated.lars_with_context:
+                full_text = prompt.split("\n")[1:]
+                train_data[i]["question"] = "".join(full_text)
+            if "Qwen" in model.config._name_or_path:
+                messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+                ]
+                input = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+                ).to(model.device)
+                kwargs = copy.deepcopy(kwargs)
+                kwargs['max_new_tokens'] = 128
+            else:
+                input = processor(
+                text=prompt,
+                images = image,
+                return_tensors="pt"
+                ).to(model.device)
+
+            most_likely = sample_generations_sequential_hf_local(
+                model,
+                input = input,
+                input_text=text,
+                tokenizer=processor.tokenizer,
+                number_of_generations=1,
+                do_sample=False,
+                return_text=True,
+                return_logprobs=True,
+                return_model_output=True,
+                top_p=1,
+                temperature=None,
+                **kwargs,
+            )
+            if "Qwen" in model.config._name_or_path:
+                probs_combined_most_likely, _,full_text = LeMUQ_ablated._generate_probs_conditions_qwen(model, processor, most_likely["model_outputs"][0][0], prompt, question, most_likely['generated_texts'][0], image, forward_hf=False)
+                probs_combined_most_likely = self.filter_probs(probs_combined_most_likely)
+                val_data[i]["generated_text"] = most_likely["generated_texts"][0]
+                val_data[i]["probs"] = [
+                    probs_combined_most_likely#.tolist()
+                    #np.exp(most_likely["logprobs"][0]).tolist()
+                    ]
+                val_data[i]["token_texts"] = [
+                    processor.decode([token]) for token in most_likely["tokens"][0]
+                ] + ['\n']
+                val_data[i]["label"] = correctness_evaluator(
+                    val_data[i]["question"],
+                    most_likely["generated_texts"][0],
+                    val_data[i]["ground_truths"],
+                )
+            else:
+                probs_combined_most_likely, _,full_text = LeMUQ_ablated._generate_probs_conditions_llava(model, processor, most_likely["model_outputs"][0][0], question, image, forward_hf=False)
+                probs_combined_most_likely = self.filter_probs(probs_combined_most_likely)
+                val_data[i]["generated_text"] = most_likely["generated_texts"][0]
+                val_data[i]["probs"] = [
+                    probs_combined_most_likely#.tolist()
+                    #np.exp(most_likely["logprobs"][0]).tolist()
+                    ]
+                val_data[i]["token_texts"] = [
+                    processor.decode([token]) for token in most_likely["tokens"][0]
+                ]
+                val_data[i]["label"] = correctness_evaluator(
+                    val_data[i]["question"],
+                    most_likely["generated_texts"][0],
+                    val_data[i]["ground_truths"],
+                )
+        #ToDo check for negative length mismatch
+        train_data, val_data = LeMUQ_ablated.drop_negative_mismatch_generations(train_data, val_data)
+        print(train_data, val_data)
+        return train_data, val_data
+    
+    @staticmethod
+    def save_datasets(train_data, val_data, save_path):
+        os.makedirs(save_path, exist_ok=True)
+
+        with open(os.path.join(save_path, "train_data.pkl"), "wb") as f:
+            pickle.dump(train_data, f)
+
+        with open(os.path.join(save_path, "val_data.pkl"), "wb") as f:
+            pickle.dump(val_data, f)
+
+    @staticmethod
+    def load_datasets(save_path):
+        with open(os.path.join(save_path, "train_data.pkl"), "rb") as f:
+            train_data = pickle.load(f)
+
+        with open(os.path.join(save_path, "val_data.pkl"), "rb") as f:
+            val_data = pickle.load(f)
+
+        return train_data, val_data
+    
+    
+    def generate_and_save_labeled_data(
+        self,
+        datasets,
+        size_for_each_dataset,
+        val_ratio,
+        seed,
+        chat_model_name,
+        correctness_evaluator,
+        context_mode=None,
+        dataset_csv=None,
+        dataset_path=None,
+        kb_path = None,
+        image_directory=None,
+        retrieval_file = None,
+        previous_context=None,
+        user_prompt=None,
+        num_gen_per_question=5,
+        save_data_path=None,
+        save_with_context = False,
+        **kwargs,
+    ):
+        assert val_ratio > 0
+        if save_with_context:
+            raise NotImplementedError("save with context for custom LARS is yet to be implemented")
+        # 1. Load and split datasets
+        train_data, val_data = LeMUQ_ablated._get_datasets(
+            datasets,
+            size_for_each_dataset,
+            val_ratio,
+            seed,
+            context_mode=context_mode,
+            dataset_csv=dataset_csv,
+            dataset_path=dataset_path,
+            kb_path=kb_path,
+            image_directory=image_directory,
+            retrieval_file = retrieval_file
+        )
+
+        # 2. Load model + processor (8-bit)
+        if chat_model_name == "llava-hf/llava-1.5-7b-hf":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+
+            chat_processor = AutoProcessor.from_pretrained(chat_model_name)
+            chat_model = LlavaForConditionalGeneration.from_pretrained(
+                chat_model_name,
+                quantization_config=quant_config,
+                device_map="auto",
+            )
+        else:
+            chat_model = Qwen3VLForConditionalGeneration.from_pretrained(
+            chat_model_name,
+            dtype="auto",           # automatically chooses FP16/FP32 depending on device
+            device_map="auto"       # automatically places layers on GPU/CPU
+        )
+            chat_processor = AutoProcessor.from_pretrained(chat_model_name)
+
+        # 3. Generate answers and labels
+        train_data, val_data = self._generate_answers_and_label(
+            train_data=train_data,
+            val_data=val_data,
+            model=chat_model,
+            processor=chat_processor,
+            correctness_evaluator=correctness_evaluator,
+            previous_context=previous_context,
+            user_prompt=user_prompt,
+            num_gen_per_question=num_gen_per_question,
+            pad_token_id=chat_processor.tokenizer.pad_token_id,
+            eos_token_id=chat_processor.tokenizer.eos_token_id,
+            **kwargs,
+        )
+
+        # 4. Cleanup
+        del chat_model
+        del chat_processor
+
+        # 5. Save if requested
+        if save_data_path:
+            LeMUQ_ablated.save_datasets(train_data, val_data, save_data_path)
+        return train_data, val_data
+    
+
+
+    def _prepare_model_and_tokenizer(self, model, tokenizer, number_of_bins, edges):
+        print("Preparing LARS model and tokenizer...")
+
+        token_groups = []
+
+        if self.p_prime:
+            base_prob_tokens = [f"[prob_token_{i}]" for i in range(number_of_bins)]
+            token_groups.append(base_prob_tokens)
+
+        if self.p_q_i:
+            img_no_ctx_tokens = [
+                f"[prob_token_img_no_ctx_{i}]" for i in range(number_of_bins)
+            ]
+            token_groups.append(img_no_ctx_tokens)
+
+        if self.p_q_c:
+            no_img_ctx_tokens = [
+                f"[prob_token_no_img_ctx_{i}]" for i in range(number_of_bins)
+            ]
+            token_groups.append(no_img_ctx_tokens)
+
+        if self.p_q:
+            no_img_no_ctx_tokens = [
+                f"[prob_token_no_img_no_ctx_{i}]" for i in range(number_of_bins)
+            ]
+            token_groups.append(no_img_no_ctx_tokens)
+
+        prob_tokens = [tok for group in token_groups for tok in group]
+
+        num_added_toks = tokenizer.add_special_tokens(
+            {"additional_special_tokens": prob_tokens}
+        )
+        print("Number of tokens added:", num_added_toks)
+
+        if num_added_toks > 0:
+            model.resize_token_embeddings(len(tokenizer))
+
+            # initialize embeddings of prob tokens
+            embeddings = model.get_input_embeddings()
+            num_ones = int(embeddings.weight.data.shape[1] / number_of_bins)
+            scale = (
+                torch.sum(torch.abs(embeddings.weight.data))
+                / embeddings.weight.data.shape[1]
+                / embeddings.weight.data.shape[0]
+            )
+
+            with torch.no_grad():
+                for token_group in token_groups:
+                    for i, tok in enumerate(token_group):
+                        tok_id = tokenizer.convert_tokens_to_ids(tok)
+                        if tok_id == tokenizer.unk_token_id:
+                            continue
+
+                        idx = number_of_bins - i - 1
+                        vector = torch.zeros_like(embeddings.weight.data[0])
+                        vector[num_ones * idx : num_ones * (idx + 1)] = (
+                            1.0 * scale * number_of_bins
+                        )
+                        embeddings.weight.data[tok_id] = vector
+
+        model.config.edges = list(edges)
+        model.config.number_of_bins = number_of_bins
+
+
+    def _prepare_data(
+        self, tokenizer, train_data: list, val_data: list, number_of_bins: int, edges: list
+    ):
+
+        print("Preparing train data for LARS training...")
+        all_data = []
+        for d in tqdm(train_data):
+            question = d["question"]
+            for i in range(len(d["probs"])):
+                if d["labels"][i] != -1:
+                    ans_text = self.prepare_answer_text(
+                        d["probs"][i], d["token_texts"][i], edges, number_of_bins
+                    )
+                    tokenized_input = LeMUQ_ablated.tokenize_input(
+                        tokenizer, question, ans_text)
+                    all_data.append(
+                        {
+                            "label": d["labels"][i],
+                            "input_ids": tokenized_input["input_ids"],
+                            "token_type_ids": tokenized_input["token_type_ids"],
+                            "attention_mask": tokenized_input["attention_mask"],
+                        }
+                    )
+        print("Preparing validation data for LARS training...")
+        all_test_data = []
+        for d in tqdm(val_data):
+            ans_text = self.prepare_answer_text(
+                d["probs"][0], d["token_texts"], edges, number_of_bins
+            )
+            tokenized_input = LeMUQ_ablated.tokenize_input(
+                tokenizer, d["question"], ans_text)
+            if d["label"] != -1:
+                all_test_data.append(
+                    {
+                        "label": d["label"],
+                        "input_ids": tokenized_input["input_ids"],
+                        "token_type_ids": tokenized_input["token_type_ids"],
+                        "attention_mask": tokenized_input["attention_mask"],
+                    }
+                )
+        return Dataset.from_list(all_data), Dataset.from_list(all_test_data)
+
+    @staticmethod
+    def _test_loss(test_data, model, metrics, device):
+        model.eval()
+        losses = []
+        scores = []
+        labels = []
+        cross_loss = torch.nn.BCEWithLogitsLoss()
+        for i in range(len(test_data)):
+            # test loss code
+            label = torch.tensor(
+                test_data[i]["label"]).reshape(1, -1).to(device)
+            input_ids = (
+                torch.tensor(test_data[i]["input_ids"]
+                             ).reshape(1, -1).to(device)
+            )
+            attention_mask = (
+                torch.tensor(test_data[i]["attention_mask"]).reshape(
+                    1, -1).to(device)
+            )
+            token_type_ids = (
+                torch.tensor(test_data[i]["token_type_ids"]).reshape(
+                    1, -1).to(device)
+            )
+
+            logits = model(
+                input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids
+            ).logits.detach()
+            loss = cross_loss(logits[:, :], label.reshape(-1, 1).float())
+            scores.append(torch.nn.functional.sigmoid(logits[:, 0]).item())
+            labels.append(label.item())
+            losses.append(loss.item())
+
+        losses = np.array(losses)
+        metric_scores = metric_score(metrics, labels, scores, scores)
+
+        return np.mean(losses), metric_scores
+
+    @staticmethod
+    def _train(
+        train_dataset: Dataset,
+        val_dataset: Dataset,
+        model,
+        tokenizer,
+        save_path: str = None,
+        device="cuda",
+        test_metrics: list[str] = ["auroc"],
+        main_metric: str = "auroc",
+        wandb_run=None,
+        number_of_bins: int = 8,
+        epochs: int = 3,
+        lr: float = 5e-6,
+        batch_size: int = 8,
+        test_freq: int = 100,
+    ):
+
+        expected_features = {"label", "input_ids",
+                             "token_type_ids", "attention_mask"}
+        assert expected_features.issubset(set(train_dataset.features.keys()))
+        assert expected_features.issubset(set(val_dataset.features.keys()))
+        assert main_metric in test_metrics
+
+        print("LARS training started...")
+
+        def custom_collate_fn(batch):
+            # Convert lists to tensors and stack them
+            labels = torch.stack([torch.tensor(item["label"])
+                                 for item in batch])
+            inps = torch.stack([torch.tensor(item["input_ids"])
+                               for item in batch])
+            types = torch.stack(
+                [torch.tensor(item["token_type_ids"]) for item in batch]
+            )
+            masks = torch.stack(
+                [torch.tensor(item["attention_mask"]) for item in batch]
+            )
+
+            return labels, inps, types, masks
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=custom_collate_fn,
+            pin_memory=True,
+            pin_memory_device=device,
+        )
+
+        # Set loss and optimizer
+        cross_loss = torch.nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+        model.to(device)
+
+        best_score = 0.0
+        best_model = None
+
+        with torch.no_grad():
+            model.eval()
+            tloss, metric_scores = LeMUQ_ablated._test_loss(
+                val_dataset, model, test_metrics, device
+            )
+            log = f"Test loss: {tloss:.2f}"
+            for key, val in metric_scores.items():
+                log += f"  | Test {key}: {val:.2f}"
+            print(log)
+            if wandb_run:
+                wandb_run.log(
+                    {"iter": 0, "test_loss": tloss}.update(metric_scores))
+            model.train()
+
+        for epoch in range(epochs):
+            model.train()
+            train_loss, total_sample = 0, 0
+            for iteration, (
+                labels,
+                input_ids,
+                token_type_ids,
+                attention_mask,
+            ) in enumerate(train_loader):
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                token_type_ids = token_type_ids.to(device)
+                labels = labels.to(device)
+
+                # Forward pass
+                optimizer.zero_grad()
+                logits = model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids,
+                ).logits
+                loss = cross_loss(logits, labels.reshape(-1, 1).float())
+
+                loss.backward()
+
+                # mask the embeddings of the prob tokens -- only works for roberta
+                grad_mask = torch.ones_like(
+                    model.roberta.embeddings.word_embeddings.weight.grad
+                )
+                grad_mask[-number_of_bins:] = 0.0
+                model.roberta.embeddings.word_embeddings.weight.grad *= grad_mask
+
+                optimizer.step()
+                train_loss += loss.item() * len(labels)
+                total_sample += len(labels)
+
+                if (iteration) % test_freq == 0:
+                    model.eval()
+
+                    with torch.no_grad():
+                        tloss, metric_scores = LeMUQ_ablated._test_loss(
+                            val_dataset, model, test_metrics, device
+                        )
+                        log = f"epoch {epoch} | Train loss: {train_loss/total_sample:.2f}  | Test loss: {tloss:.2f}"
+                        for key, val in metric_scores.items():
+                            log += f"  | Test {key}: {val:.2f}"
+                        print(log)
+                    if wandb_run:
+                        wandb_run.log(
+                            {
+                                "iter": iteration,
+                                "train_loss": train_loss / total_sample,
+                                "test_loss": tloss,
+                            }.update(metric_scores)
+                        )
+
+                    if metric_scores[main_metric] > best_score:
+                        best_model = copy.deepcopy(model.cpu())
+                        best_score = metric_scores[main_metric]
+                        if save_path:
+                            best_model.save_pretrained(save_path)
+                            tokenizer.save_pretrained(save_path)
+                        model.to(device)
+                        if save_path:
+                            checkpoint = {
+                                "best_metric": best_score,
+                                "main_metric": main_metric,
+                                "epoch": epoch,
+                                "iteration": iteration,
+                                "lr": lr,
+                                "batch_size": batch_size,
+                                "number_of_bins": number_of_bins,
+                            }
+                            # Save the checkpoint
+                            with open(os.path.join(save_path, "training_metadata.json"), "w") as f:
+                                json.dump(checkpoint, f, indent=2)
+
+                    train_loss, total_sample = 0, 0
+                    model.train()
+        return best_model
+    
+
+
+
+    def train_lars_model(
+        self,
+        datasets: list,
+        size_for_each_dataset: list,
+        val_ratio: float,
+        seed: int,
+        chat_model_name: str,
+        correctness_evaluator,
+        save_path: str = None,
+        wandb_run=None,
+        previous_context: list = [
+            {"role": "system", "content": DEFAULT_SYSTEM_BENCHMARK_PROMPT}
+        ],
+        user_prompt: str = DEFAULT_LLAVA_PROMPT_NO_CONTEXT,
+        num_gen_per_question: int = 5,
+        number_of_bins: int = 8,
+        lars_model_name: str = "duygunuryldz/LARS", #"roberta-base",
+        test_metrics: list[str] = ["auroc"],
+        main_metric: str = "auroc",
+        epochs: int = 3,
+        lr: float = 5e-6,
+        batch_size: int = 8,
+        test_freq: int = 100,
+        device="cuda",
+        context_mode = None,
+        dataset_csv= None,
+        dataset_path = None,
+        kb_path = None,
+        image_directory = None,
+        load_data_path = None,
+        save_data_path = None,
+        **kwargs,
+    ):
+        if load_data_path:
+            train_data, val_data = LeMUQ_ablated.load_datasets(load_data_path)
+        else:
+            train_data, val_data = self.generate_and_save_labeled_data(
+            datasets=datasets,
+            size_for_each_dataset=size_for_each_dataset,
+            val_ratio=val_ratio,
+            seed=seed,
+            chat_model_name=chat_model_name,
+            correctness_evaluator=correctness_evaluator,
+            context_mode=context_mode,
+            dataset_csv=dataset_csv,
+            dataset_path=dataset_path,
+            kb_path = kb_path,
+            image_directory=image_directory,
+            previous_context=previous_context,
+            user_prompt=user_prompt,
+            num_gen_per_question=num_gen_per_question,
+            save_data_path=save_data_path,
+            **kwargs,
+            )
+        # Find edges
+        all_probs = []
+        for d in tqdm(train_data):
+            for i in range(len(d["probs"])):
+                for prob in d["probs"][i]: # i guess this seems reasonable?
+                    all_probs += prob
+        edges = np.quantile(all_probs, np.linspace(0, 1, number_of_bins))
+        all_probs = None
+
+        # create LARS model
+        model = AutoModelForSequenceClassification.from_pretrained(
+            lars_model_name, num_labels=1
+        ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(lars_model_name)
+
+        
+        self._prepare_model_and_tokenizer(
+            model=model, tokenizer=tokenizer, number_of_bins=number_of_bins, edges=edges
+        )
+
+        # prepare data for LARS training, return train and val datasets
+
+        train_dataset, val_dataset = self._prepare_data(
+            tokenizer=tokenizer,
+            train_data=train_data,
+            val_data=val_data,
+            number_of_bins=number_of_bins,
+            edges=edges,
+        )
+
+
+        model = LeMUQ_ablated._train(
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            model=model,
+            tokenizer=tokenizer,
+            save_path=save_path,
+            device=device,
+            test_metrics=test_metrics,
+            main_metric=main_metric,
+            wandb_run=wandb_run,
+            number_of_bins=number_of_bins,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            test_freq=test_freq,
+        )
+
+        return model, tokenizer, train_data, val_data

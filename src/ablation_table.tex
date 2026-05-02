@@ -1,0 +1,30 @@
+% === Ablation Study Table =====================
+% Requires in preamble:
+% \usepackage[table,dvipsnames]{xcolor}
+% \usepackage{multirow}
+% Optional if not already defined:
+% \newcommand{\shrink}{\resizebox{\columnwidth}{!}}
+\renewcommand{\arraystretch}{1.15}
+\begin{table*}[t]
+\centering
+\setlength{\tabcolsep}{2.9pt}
+\caption{Ablation study AUROC performance across EVQA and InfoSeek for LLaVA1.5-7B and Qwen3-VL-4B. BM25, EVAC., and BM25+MLM are used as retrieval models. $\text{LARS}_{Ret}$ uses the finetuned LARS model matched to the corresponding retrieval setting. LeMUQ denotes the full method, and the remaining rows remove one component at a time. Superscripts \textsuperscript{\dag} and \textsuperscript{\ddag} denote statistically significant differences according to the DeLong test ($p<0.05$), compared to $\text{LARS}_{Ret}$ and LeMUQ, respectively.}
+\label{tab:lemuq_ablation}
+\shrink
+\begin{tabular}{l|ll|ll|ll|ll|ll|ll|l}
+\hline
+\textbf{LLM} & \multicolumn{6}{c|}{\textbf{LLaVA1.5-7B}} & \multicolumn{6}{c|}{\textbf{Qwen3-VL-4B}} & \multirow{3}{*}{\textbf{Avg.}} \\ \cline{1-13}
+\textbf{Retriever} & \multicolumn{2}{c}{\textbf{BM25}} & \multicolumn{2}{c}{\textbf{EVAC.}} & \multicolumn{2}{c|}{\textbf{BM25+MLM}} & \multicolumn{2}{c}{\textbf{BM25}} & \multicolumn{2}{c}{\textbf{EVAC.}} & \multicolumn{2}{c|}{\textbf{BM25+MLM}} & \\ \cline{1-13}
+\textbf{} & EVQA & InfoSeek & EVQA & InfoSeek & EVQA & InfoSeek & EVQA & InfoSeek & EVQA & InfoSeek & EVQA & InfoSeek & \\ \hline
+\rowcolor{gray!15} Accuracy & 0.128 & 0.118 & 0.138 & 0.102 & 0.163 & 0.147 & 0.136 & 0.142 & 0.132 & 0.128 & 0.171 & 0.140 & 0.137 \\
+$\text{LARS}_{Base}$ & 0.689 & 0.762 & 0.709 & 0.752 & 0.687 & 0.752 & 0.673 & 0.767 & 0.769 & 0.815 & 0.610 & 0.773 & 0.730 \\
+$\text{LARS}_{Ret}$ & 0.847 & 0.829 & 0.848 & 0.823 & 0.846 & 0.791 & 0.832 & 0.861 & 0.882 & 0.889 & 0.816 & 0.843 & 0.842 \\
+\textbf{LeMUQ} & 0.855 & 0.832 & \textbf{0.861} & \textbf{0.854}\textsuperscript{\dag} & \textbf{0.871}\textsuperscript{\dag} & 0.853\textsuperscript{\dag} & 0.920\textsuperscript{\dag} & 0.889\textsuperscript{\dag} & 0.917\textsuperscript{\dag} & 0.909\textsuperscript{\dag} & 0.902\textsuperscript{\dag} & 0.901\textsuperscript{\dag} & \textbf{0.880} \\
+LeMUQ $-\tilde{p}'$ & 0.841 & 0.826 & 0.852 & 0.825\textsuperscript{\ddag} & 0.859 & 0.844\textsuperscript{\dag} & 0.921\textsuperscript{\dag} & 0.903\textsuperscript{\dag}\textsuperscript{\ddag} & 0.910\textsuperscript{\dag} & 0.906\textsuperscript{\dag} & 0.894\textsuperscript{\dag} & \textbf{0.909}\textsuperscript{\dag} & 0.874 \\
+LeMUQ $-\tilde{p}^{q,i}$ & 0.856 & 0.845 & 0.851 & 0.829\textsuperscript{\ddag} & 0.840\textsuperscript{\ddag} & 0.829\textsuperscript{\dag}\textsuperscript{\ddag} & \textbf{0.924}\textsuperscript{\dag} & 0.891\textsuperscript{\dag} & 0.912\textsuperscript{\dag} & 0.906\textsuperscript{\dag} & \textbf{0.907}\textsuperscript{\dag} & 0.893\textsuperscript{\dag} & 0.873 \\
+LeMUQ $-\tilde{p}^{q,c}$ & 0.852 & 0.818 & 0.852 & 0.849\textsuperscript{\dag} & 0.856 & \textbf{0.862}\textsuperscript{\dag} & 0.923\textsuperscript{\dag} & \textbf{0.906}\textsuperscript{\dag}\textsuperscript{\ddag} & \textbf{0.919}\textsuperscript{\dag} & 0.899 & 0.895\textsuperscript{\dag} & 0.905\textsuperscript{\dag} & 0.878 \\
+LeMUQ $-\tilde{p}^{q}$ & \textbf{0.859} & \textbf{0.849} & 0.851 & 0.848\textsuperscript{\dag} & 0.864 & 0.851\textsuperscript{\dag} & 0.906\textsuperscript{\dag}\textsuperscript{\ddag} & 0.902\textsuperscript{\dag}\textsuperscript{\ddag} & 0.916\textsuperscript{\dag} & \textbf{0.911}\textsuperscript{\dag} & 0.886\textsuperscript{\dag}\textsuperscript{\ddag} & 0.905\textsuperscript{\dag} & 0.879 \\
+\hline
+\end{tabular}
+\miniskip
+\end{table*}

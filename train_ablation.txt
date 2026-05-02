@@ -1,0 +1,182 @@
+sbatch <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=lars_ablated
+#SBATCH --time=1-00:00:00
+#SBATCH --gpus=1
+#SBATCH --mem=160000
+#SBATCH --partition=RTXA6000,H100,H100-SEE,H200
+#SBATCH --array=0-47
+#SBATCH --output=/log_root_dir/lars_ablated_%A_%a.out
+#SBATCH --error=/log_root_dir/lars_ablated_%A_%a.err
+
+set -euo pipefail
+
+# =========================
+# USER CONFIG
+# =========================
+LOG_DIR="/log_root_dir"
+DATA_ROOT="/dataset_root_dir"
+MODEL_ROOT="/model_root_dir"
+ABLATED_MODEL_ROOT="${MODEL_ROOT}/ablated"
+SCRATCH_ROOT="/scratch_root_dir"
+FSCRATCH_ROOT="/fast_scratch_root_dir"
+CONTAINER_IMAGE="/container_image.sqsh"
+INSTALL_SCRIPT="install_qwen.sh"
+
+EVQA_DATASET_DIR="${DATA_ROOT}/evqa"
+EVQA_IMAGE_DIR="${EVQA_DATASET_DIR}/images/raw"
+EVQA_DATASET_CSV="evqa_train.csv"
+EVQA_KB_PATH="${EVQA_DATASET_DIR}/"
+EVQA_TRAINING_DATA_DIR="${EVQA_DATASET_DIR}/lars_ablated"
+
+INFOSEEK_DATASET_DIR="${DATA_ROOT}/infoseek"
+INFOSEEK_IMAGE_DIR="${INFOSEEK_DATASET_DIR}/images"
+INFOSEEK_DATASET_CSV="infoseek_train.csv"
+INFOSEEK_TRAINING_DATA_DIR="${INFOSEEK_DATASET_DIR}/lars_ablated"
+
+LLAVA_MODEL="llava-hf/llava-1.5-7b-hf"
+QWEN_MODEL="Qwen/Qwen3-VL-4B-Instruct"
+
+SIZE=15000
+VAL_RATIO=0.1
+SEED=0
+NUM_GEN_PER_QUESTION=5
+
+mkdir -p "${LOG_DIR}"
+
+CONFIGS=(
+  "infoseek llava bm25 no_p_prime"
+  "infoseek llava bm25 no_p_q_c"
+  "infoseek llava bm25 no_p_q_i"
+  "infoseek llava bm25 no_p_q"
+  "infoseek llava rerank no_p_prime"
+  "infoseek llava rerank no_p_q_c"
+  "infoseek llava rerank no_p_q_i"
+  "infoseek llava rerank no_p_q"
+  "infoseek llava eva_clip+contriever no_p_prime"
+  "infoseek llava eva_clip+contriever no_p_q_c"
+  "infoseek llava eva_clip+contriever no_p_q_i"
+  "infoseek llava eva_clip+contriever no_p_q"
+  "infoseek qwen bm25 no_p_prime"
+  "infoseek qwen bm25 no_p_q_c"
+  "infoseek qwen bm25 no_p_q_i"
+  "infoseek qwen bm25 no_p_q"
+  "infoseek qwen rerank no_p_prime"
+  "infoseek qwen rerank no_p_q_c"
+  "infoseek qwen rerank no_p_q_i"
+  "infoseek qwen rerank no_p_q"
+  "infoseek qwen eva_clip+contriever no_p_prime"
+  "infoseek qwen eva_clip+contriever no_p_q_c"
+  "infoseek qwen eva_clip+contriever no_p_q_i"
+  "infoseek qwen eva_clip+contriever no_p_q"
+  "evqa llava bm25 no_p_prime"
+  "evqa llava bm25 no_p_q_c"
+  "evqa llava bm25 no_p_q_i"
+  "evqa llava bm25 no_p_q"
+  "evqa llava rerank no_p_prime"
+  "evqa llava rerank no_p_q_c"
+  "evqa llava rerank no_p_q_i"
+  "evqa llava rerank no_p_q"
+  "evqa llava eva_clip+contriever no_p_prime"
+  "evqa llava eva_clip+contriever no_p_q_c"
+  "evqa llava eva_clip+contriever no_p_q_i"
+  "evqa llava eva_clip+contriever no_p_q"
+  "evqa qwen bm25 no_p_prime"
+  "evqa qwen bm25 no_p_q_c"
+  "evqa qwen bm25 no_p_q_i"
+  "evqa qwen bm25 no_p_q"
+  "evqa qwen rerank no_p_prime"
+  "evqa qwen rerank no_p_q_c"
+  "evqa qwen rerank no_p_q_i"
+  "evqa qwen rerank no_p_q"
+  "evqa qwen eva_clip+contriever no_p_prime"
+  "evqa qwen eva_clip+contriever no_p_q_c"
+  "evqa qwen eva_clip+contriever no_p_q_i"
+  "evqa qwen eva_clip+contriever no_p_q"
+)
+
+read DATASET MODEL_FAMILY RETRIEVAL ABLATION <<< "${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
+
+case "$MODEL_FAMILY" in
+  qwen) CHAT_MODEL="${QWEN_MODEL}" ;;
+  llava) CHAT_MODEL="${LLAVA_MODEL}" ;;
+  *) echo "Unknown model family: $MODEL_FAMILY"; exit 1 ;;
+esac
+
+case "$DATASET" in
+  infoseek)
+    DATASET_PATH="${INFOSEEK_DATASET_DIR}"
+    IMAGE_DIR="${INFOSEEK_IMAGE_DIR}"
+    DATASET_CSV="${INFOSEEK_DATASET_CSV}"
+    TRAINING_DATA_DIR="${INFOSEEK_TRAINING_DATA_DIR}"
+    case "$RETRIEVAL" in
+      bm25) RETRIEVAL_FILE="bm25_train.csv"; RETRIEVAL_TAG="bm25"; CONTEXT_MODE="bm25" ;;
+      rerank) RETRIEVAL_FILE="rerank_train.csv"; RETRIEVAL_TAG="rerank"; CONTEXT_MODE="rerank" ;;
+      eva_clip+contriever) RETRIEVAL_FILE="eva_clip_train.csv"; RETRIEVAL_TAG="eva_clip"; CONTEXT_MODE="eva_clip+contriever" ;;
+      *) echo "Unknown retrieval for infoseek: $RETRIEVAL"; exit 1 ;;
+    esac
+    ;;
+  evqa)
+    DATASET_PATH="${EVQA_DATASET_DIR}"
+    IMAGE_DIR="${EVQA_IMAGE_DIR}"
+    DATASET_CSV="${EVQA_DATASET_CSV}"
+    TRAINING_DATA_DIR="${EVQA_TRAINING_DATA_DIR}"
+    case "$RETRIEVAL" in
+      bm25) RETRIEVAL_FILE="bm25_train.csv"; RETRIEVAL_TAG="bm25"; CONTEXT_MODE="bm25" ;;
+      rerank) RETRIEVAL_FILE="rerank_train.csv"; RETRIEVAL_TAG="rerank"; CONTEXT_MODE="rerank" ;;
+      eva_clip+contriever) RETRIEVAL_FILE="eva_clip_train.csv"; RETRIEVAL_TAG="eva_clip"; CONTEXT_MODE="eva_clip+contriever" ;;
+      *) echo "Unknown retrieval for evqa: $RETRIEVAL"; exit 1 ;;
+    esac
+    ;;
+  *) echo "Unknown dataset: $DATASET"; exit 1 ;;
+esac
+
+mkdir -p "${TRAINING_DATA_DIR}" "${ABLATED_MODEL_ROOT}"
+
+P_PRIME_FLAG="--p_prime"
+P_Q_C_FLAG="--p_q_c"
+P_Q_I_FLAG="--p_q_i"
+P_Q_FLAG="--p_q"
+
+case "$ABLATION" in
+  no_p_prime) P_PRIME_FLAG=""; ABLATION_TAG="no_p_prime" ;;
+  no_p_q_c) P_Q_C_FLAG=""; ABLATION_TAG="no_p_q_c" ;;
+  no_p_q_i) P_Q_I_FLAG=""; ABLATION_TAG="no_p_q_i" ;;
+  no_p_q) P_Q_FLAG=""; ABLATION_TAG="no_p_q" ;;
+  *) echo "Unknown ablation: $ABLATION"; exit 1 ;;
+esac
+
+SAVE_DATA_PATH="${TRAINING_DATA_DIR}/lars_ablated_${MODEL_FAMILY}_${RETRIEVAL_TAG}_${ABLATION_TAG}"
+SAVE_MODEL_PATH="${ABLATED_MODEL_ROOT}/${DATASET}_lars_ablated_${MODEL_FAMILY}_${RETRIEVAL_TAG}_${ABLATION_TAG}"
+
+echo "Dataset=${DATASET} Model=${MODEL_FAMILY} Retrieval=${RETRIEVAL} Ablation=${ABLATION} Save=${SAVE_MODEL_PATH}"
+
+srun \
+  --container-image="${CONTAINER_IMAGE}" \
+  --container-workdir="$(pwd)" \
+  --container-mounts="${SCRATCH_ROOT}:${SCRATCH_ROOT},$(pwd):$(pwd),${FSCRATCH_ROOT}:${FSCRATCH_ROOT}" \
+  bash -c "
+    set -e
+    bash ${INSTALL_SCRIPT}
+    cd src
+    python3 train_lemuq_ablated.py \
+      --datasets ${DATASET} \
+      --size-for-each-dataset ${SIZE} \
+      --val-ratio ${VAL_RATIO} \
+      --seed ${SEED} \
+      --chat-model-name ${CHAT_MODEL} \
+      --context-mode ${CONTEXT_MODE} \
+      --dataset-path ${DATASET_PATH} \
+      --dataset-csv ${DATASET_CSV} \
+      --retrieval-file ${RETRIEVAL_FILE} \
+      --image-directory ${IMAGE_DIR} \
+      --kb-path ${EVQA_KB_PATH} \
+      --save-data-path ${SAVE_DATA_PATH} \
+      --save-model-path ${SAVE_MODEL_PATH} \
+      --num-gen-per-question ${NUM_GEN_PER_QUESTION} \
+      ${P_PRIME_FLAG} \
+      ${P_Q_C_FLAG} \
+      ${P_Q_I_FLAG} \
+      ${P_Q_FLAG}
+  "
+EOF

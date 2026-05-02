@@ -1,0 +1,176 @@
+sbatch <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=lars_infer
+#SBATCH --time=2-12:00:00
+#SBATCH --gpus=1
+#SBATCH --mem=160000
+#SBATCH --partition=H100,H100-SEE,H200,RTXA6000
+#SBATCH --array=0-23
+#SBATCH --output=/log_root_dir/lars_infer_%A_%a.out
+#SBATCH --error=/log_root_dir/lars_infer_%A_%a.err
+
+set -euo pipefail
+
+# =========================
+# USER CONFIG
+# =========================
+LOG_DIR="/log_root_dir"
+RESULTS_ROOT="/result_root_dir/experiment_results_main"
+DATA_ROOT="/dataset_root_dir"
+MODEL_ROOT="/model_root_dir"
+SCRATCH_ROOT="/scratch_root_dir"
+FSCRATCH_ROOT="/fast_scratch_root_dir"
+CONTAINER_IMAGE="/container_image.sqsh"
+INSTALL_SCRIPT="install_qwen.sh"
+
+EVQA_DATASET_DIR="${DATA_ROOT}/evqa"
+EVQA_IMAGE_DIR="${EVQA_DATASET_DIR}/images/raw"
+EVQA_DATASET_CSV="evqa_test.csv"
+EVQA_KB_PATH="${EVQA_DATASET_DIR}/"
+
+INFOSEEK_DATASET_DIR="${DATA_ROOT}/infoseek"
+INFOSEEK_IMAGE_DIR="${INFOSEEK_DATASET_DIR}/images/"
+INFOSEEK_DATASET_CSV="infoseek_test.csv"
+
+LLAVA_MODEL="llava-hf/llava-1.5-7b-hf"
+QWEN_MODEL="Qwen/Qwen3-VL-4B-Instruct"
+
+SAMPLES=2000
+SAMPLES_PER_RUN=2000
+
+mkdir -p "${LOG_DIR}" "${RESULTS_ROOT}"
+
+CONFIGS=(
+  "evqa llava None"
+  "evqa llava doc-"
+  "evqa llava doc+"
+  "evqa llava bm25"
+  "evqa llava rerank"
+  "evqa llava eva_clip+contriever"
+  "evqa qwen None"
+  "evqa qwen doc-"
+  "evqa qwen doc+"
+  "evqa qwen bm25"
+  "evqa qwen rerank"
+  "evqa qwen eva_clip+contriever"
+  "infoseek llava None"
+  "infoseek llava doc-"
+  "infoseek llava doc+"
+  "infoseek llava bm25"
+  "infoseek llava rerank"
+  "infoseek llava eva_clip+contriever"
+  "infoseek qwen None"
+  "infoseek qwen doc-"
+  "infoseek qwen doc+"
+  "infoseek qwen bm25"
+  "infoseek qwen rerank"
+  "infoseek qwen eva_clip+contriever"
+)
+
+read DATASET MODEL_FAMILY CONTEXT_MODE <<< "${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
+
+case "$MODEL_FAMILY" in
+  qwen) CHAT_MODEL="${QWEN_MODEL}" ;;
+  llava) CHAT_MODEL="${LLAVA_MODEL}" ;;
+  *) echo "Unknown model family: $MODEL_FAMILY"; exit 1 ;;
+esac
+
+case "$DATASET" in
+  evqa)
+    DATASET_PATH="${EVQA_DATASET_DIR}"
+    IMAGE_DIR="${EVQA_IMAGE_DIR}"
+    DATASET_CSV="${EVQA_DATASET_CSV}"
+    case "$CONTEXT_MODE" in
+      None|doc+) RETRIEVAL_CSV="" ;;
+      doc-) RETRIEVAL_CSV="bm25_negative_test.csv" ;;
+      bm25) RETRIEVAL_CSV="bm25_test.csv" ;;
+      rerank) RETRIEVAL_CSV="rerank_test.csv" ;;
+      eva_clip+contriever) RETRIEVAL_CSV="eva_clip_test.csv" ;;
+      *) echo "Unknown evqa context mode: $CONTEXT_MODE"; exit 1 ;;
+    esac
+    ;;
+  infoseek)
+    DATASET_PATH="${INFOSEEK_DATASET_DIR}"
+    IMAGE_DIR="${INFOSEEK_IMAGE_DIR}"
+    DATASET_CSV="${INFOSEEK_DATASET_CSV}"
+    case "$CONTEXT_MODE" in
+      None|doc+) RETRIEVAL_CSV="" ;;
+      doc-) RETRIEVAL_CSV="bm25_negative_test.csv" ;;
+      bm25) RETRIEVAL_CSV="bm25_test.csv" ;;
+      rerank) RETRIEVAL_CSV="rerank_test.csv" ;;
+      eva_clip+contriever) RETRIEVAL_CSV="eva_clip_test.csv" ;;
+      *) echo "Unknown infoseek context mode: $CONTEXT_MODE"; exit 1 ;;
+    esac
+    ;;
+  *) echo "Unknown dataset: $DATASET"; exit 1 ;;
+esac
+
+JOB_LABEL="${DATASET}_${MODEL_FAMILY}_${CONTEXT_MODE}"
+scontrol update JobId="${SLURM_JOB_ID}" JobName="${JOB_LABEL}" >/dev/null 2>&1 || true
+
+OUTDIR="${RESULTS_ROOT}/${DATASET}_${MODEL_FAMILY}_${CONTEXT_MODE}"
+mkdir -p "${OUTDIR}"
+
+LARS_DICTS=$(cat <<JSON
+[
+  {"lars_name": "llava_evqa_bm25", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/evqa_llava/lars_bm25", "lars_with_context": false},
+  {"lars_name": "llava_evqa_bm25_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/evqa_llava/lars_modified_bm25_with_context", "lars_with_context": true},
+  {"lars_name": "llava_evqa_rerank", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/evqa_llava/lars_rerank", "lars_with_context": false},
+  {"lars_name": "llava_evqa_rerank_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/evqa_llava/lars_modified_rerank_with_context", "lars_with_context": true},
+  {"lars_name": "llava_evqa_eva_clip", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/evqa_llava/lars_eva_clip", "lars_with_context": false},
+  {"lars_name": "llava_evqa_eva_clip_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/evqa_llava/lars_modified_eva_clip_with_context", "lars_with_context": true},
+  {"lars_name": "qwen_evqa_bm25", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/evqa_qwen/lars_bm25", "lars_with_context": false},
+  {"lars_name": "qwen_evqa_bm25_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/evqa_qwen/lars_modified_bm25_with_context", "lars_with_context": true},
+  {"lars_name": "qwen_evqa_rerank", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/evqa_qwen/lars_rerank", "lars_with_context": false},
+  {"lars_name": "qwen_evqa_rerank_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/evqa_qwen/lars_modified_rerank_with_context", "lars_with_context": true},
+  {"lars_name": "qwen_evqa_eva_clip", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/evqa_qwen/lars_eva_clip", "lars_with_context": false},
+  {"lars_name": "qwen_evqa_eva_clip_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/evqa_qwen/lars_modified_eva_clip_with_context", "lars_with_context": true},
+  {"lars_name": "llava_infoseek_bm25", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/infoseek_new_llava/lars_bm25", "lars_with_context": false},
+  {"lars_name": "llava_infoseek_bm25_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/infoseek_new_llava/lars_modified_bm25_with_context", "lars_with_context": true},
+  {"lars_name": "llava_infoseek_rerank", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/infoseek_new_llava/lars_rerank", "lars_with_context": false},
+  {"lars_name": "llava_infoseek_rerank_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/infoseek_new_llava/lars_modified_rerank_with_context", "lars_with_context": true},
+  {"lars_name": "llava_infoseek_eva_clip", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/infoseek_new_llava/lars_eva_clip", "lars_with_context": false},
+  {"lars_name": "llava_infoseek_eva_clip_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/infoseek_new_llava/lars_modified_eva_clip_with_context", "lars_with_context": true},
+  {"lars_name": "qwen_infoseek_bm25", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/infoseek_new_qwen/lars_bm25", "lars_with_context": false},
+  {"lars_name": "qwen_infoseek_bm25_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/infoseek_new_qwen/lars_modified_bm25_with_context", "lars_with_context": true},
+  {"lars_name": "qwen_infoseek_rerank", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/infoseek_new_qwen/lars_rerank", "lars_with_context": false},
+  {"lars_name": "qwen_infoseek_rerank_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/infoseek_new_qwen/lars_modified_rerank_with_context", "lars_with_context": true},
+  {"lars_name": "qwen_infoseek_eva_clip", "lars_version": "lars_finetuned", "model_path": "${MODEL_ROOT}/infoseek_new_qwen/lars_eva_clip", "lars_with_context": false},
+  {"lars_name": "qwen_infoseek_eva_clip_with_context", "lars_version": "lemuq", "model_path": "${MODEL_ROOT}/infoseek_new_qwen/lars_modified_eva_clip_with_context", "lars_with_context": true}
+]
+JSON
+)
+
+if [ -n "${RETRIEVAL_CSV}" ]; then
+  RETRIEVAL_ARG="--retrieval_csv ${RETRIEVAL_CSV}"
+else
+  RETRIEVAL_ARG=""
+fi
+
+echo "Dataset=${DATASET} Model=${MODEL_FAMILY} Context=${CONTEXT_MODE} Output=${OUTDIR}"
+
+srun \
+  --container-image="${CONTAINER_IMAGE}" \
+  --container-workdir="$(pwd)" \
+  --container-mounts="${SCRATCH_ROOT}:${SCRATCH_ROOT},$(pwd):$(pwd),${FSCRATCH_ROOT}:${FSCRATCH_ROOT}" \
+  bash -c "
+    set -e
+    bash ${INSTALL_SCRIPT}
+    cd src
+    python3 main.py \
+      --truth_methods eccunc entropy ptrue prelevant lars \
+      --model ${CHAT_MODEL} \
+      --dataset ${DATASET} \
+      --context_mode ${CONTEXT_MODE} \
+      --samples ${SAMPLES} \
+      --samples_per_run ${SAMPLES_PER_RUN} \
+      --output_dir ${OUTDIR} \
+      --no_8bit \
+      --dataset_path ${DATASET_PATH} \
+      --kb_path ${EVQA_KB_PATH} \
+      --dataset_csv ${DATASET_CSV} \
+      ${RETRIEVAL_ARG} \
+      --image_directory ${IMAGE_DIR} \
+      --lars_dicts '${LARS_DICTS}'
+  "
+EOF

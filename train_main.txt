@@ -1,0 +1,161 @@
+sbatch <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=lars_ft
+#SBATCH --time=2-12:00:00
+#SBATCH --gpus=1
+#SBATCH --mem=160000
+#SBATCH --partition=RTXA6000,H100,H100-SEE,H200
+#SBATCH --array=0-23
+#SBATCH --output=/log_root_dir/lars_ft_%A_%a.out
+#SBATCH --error=/log_root_dir/lars_ft_%A_%a.err
+
+set -euo pipefail
+
+# =========================
+# USER CONFIG
+# =========================
+LOG_DIR="/log_root_dir"
+DATA_ROOT="/dataset_root_dir"
+MODEL_ROOT="/model_root_dir"
+SCRATCH_ROOT="/scratch_root_dir"
+FSCRATCH_ROOT="/fast_scratch_root_dir"
+CONTAINER_IMAGE="/container_image.sqsh"
+INSTALL_SCRIPT="install_qwen.sh"
+
+EVQA_DATASET_DIR="${DATA_ROOT}/evqa"
+EVQA_IMAGE_DIR="${EVQA_DATASET_DIR}/images/raw"
+EVQA_DATASET_CSV="evqa_train.csv"
+EVQA_KB_PATH="${EVQA_DATASET_DIR}/"
+EVQA_TRAINING_DATA_DIR="${EVQA_DATASET_DIR}/training_new_data"
+EVQA_LLAVA_MODEL_ROOT="${MODEL_ROOT}/evqa_llava"
+EVQA_QWEN_MODEL_ROOT="${MODEL_ROOT}/evqa_qwen"
+
+INFOSEEK_DATASET_DIR="${DATA_ROOT}/infoseek"
+INFOSEEK_IMAGE_DIR="${INFOSEEK_DATASET_DIR}/images"
+INFOSEEK_DATASET_CSV="infoseek_train.csv"
+INFOSEEK_TRAINING_DATA_DIR="${INFOSEEK_DATASET_DIR}/training_new_data"
+INFOSEEK_LLAVA_MODEL_ROOT="${MODEL_ROOT}/infoseek_new_llava"
+INFOSEEK_QWEN_MODEL_ROOT="${MODEL_ROOT}/infoseek_new_qwen"
+
+LLAVA_MODEL="llava-hf/llava-1.5-7b-hf"
+QWEN_MODEL="Qwen/Qwen3-VL-4B-Instruct"
+
+SIZE=15000
+VAL_RATIO=0.1
+SEED=0
+
+mkdir -p "${LOG_DIR}"
+
+CONFIGS=(
+  "evqa llava bm25 base"
+  "evqa llava bm25 lemuq"
+  "evqa llava rerank base"
+  "evqa llava rerank lemuq"
+  "evqa llava eva_clip+contriever base"
+  "evqa llava eva_clip+contriever lemuq"
+  "evqa qwen bm25 base"
+  "evqa qwen bm25 lemuq"
+  "evqa qwen rerank base"
+  "evqa qwen rerank lemuq"
+  "evqa qwen eva_clip+contriever base"
+  "evqa qwen eva_clip+contriever lemuq"
+  "infoseek llava bm25 base"
+  "infoseek llava bm25 lemuq"
+  "infoseek llava rerank base"
+  "infoseek llava rerank lemuq"
+  "infoseek llava eva_clip+contriever base"
+  "infoseek llava eva_clip+contriever lemuq"
+  "infoseek qwen bm25 base"
+  "infoseek qwen bm25 lemuq"
+  "infoseek qwen rerank base"
+  "infoseek qwen rerank lemuq"
+  "infoseek qwen eva_clip+contriever base"
+  "infoseek qwen eva_clip+contriever lemuq"
+)
+
+read DATASET MODEL_FAMILY RETRIEVAL VERSION <<< "${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
+
+case "$MODEL_FAMILY" in
+  qwen) CHAT_MODEL="${QWEN_MODEL}" ;;
+  llava) CHAT_MODEL="${LLAVA_MODEL}" ;;
+  *) echo "Unknown model family: $MODEL_FAMILY"; exit 1 ;;
+esac
+
+case "$DATASET" in
+  evqa)
+    DATASET_PATH="${EVQA_DATASET_DIR}"
+    IMAGE_DIR="${EVQA_IMAGE_DIR}"
+    DATASET_CSV="${EVQA_DATASET_CSV}"
+    TRAINING_DATA_DIR="${EVQA_TRAINING_DATA_DIR}"
+    case "$MODEL_FAMILY" in
+      qwen) MODEL_OUTPUT_ROOT="${EVQA_QWEN_MODEL_ROOT}" ;;
+      llava) MODEL_OUTPUT_ROOT="${EVQA_LLAVA_MODEL_ROOT}" ;;
+    esac
+    case "$RETRIEVAL" in
+      bm25) RETRIEVAL_FILE="bm25_train.csv"; RETRIEVAL_TAG="bm25"; CONTEXT_MODE="bm25" ;;
+      rerank) RETRIEVAL_FILE="rerank_train.csv"; RETRIEVAL_TAG="rerank"; CONTEXT_MODE="rerank" ;;
+      eva_clip+contriever) RETRIEVAL_FILE="eva_clip_train.csv"; RETRIEVAL_TAG="eva_clip"; CONTEXT_MODE="eva_clip+contriever" ;;
+      *) echo "Unknown retrieval for evqa: $RETRIEVAL"; exit 1 ;;
+    esac
+    ;;
+  infoseek)
+    DATASET_PATH="${INFOSEEK_DATASET_DIR}"
+    IMAGE_DIR="${INFOSEEK_IMAGE_DIR}"
+    DATASET_CSV="${INFOSEEK_DATASET_CSV}"
+    TRAINING_DATA_DIR="${INFOSEEK_TRAINING_DATA_DIR}"
+    case "$MODEL_FAMILY" in
+      qwen) MODEL_OUTPUT_ROOT="${INFOSEEK_QWEN_MODEL_ROOT}" ;;
+      llava) MODEL_OUTPUT_ROOT="${INFOSEEK_LLAVA_MODEL_ROOT}" ;;
+    esac
+    case "$RETRIEVAL" in
+      bm25) RETRIEVAL_FILE="bm25_train.csv"; RETRIEVAL_TAG="bm25"; CONTEXT_MODE="bm25" ;;
+      rerank) RETRIEVAL_FILE="rerank_train.csv"; RETRIEVAL_TAG="rerank"; CONTEXT_MODE="rerank" ;;
+      eva_clip+contriever) RETRIEVAL_FILE="eva_clip_train.csv"; RETRIEVAL_TAG="eva_clip"; CONTEXT_MODE="eva_clip+contriever" ;;
+      *) echo "Unknown retrieval for infoseek: $RETRIEVAL"; exit 1 ;;
+    esac
+    ;;
+  *) echo "Unknown dataset: $DATASET"; exit 1 ;;
+esac
+
+mkdir -p "${TRAINING_DATA_DIR}" "${MODEL_OUTPUT_ROOT}"
+
+if [ "$VERSION" = "base" ]; then
+  SAVE_DATA_PATH="${TRAINING_DATA_DIR}/lars_${MODEL_FAMILY}_${RETRIEVAL_TAG}"
+  SAVE_MODEL_PATH="${MODEL_OUTPUT_ROOT}/lars_${RETRIEVAL_TAG}"
+  EXTRA_ARGS=()
+elif [ "$VERSION" = "lemuq" ]; then
+  SAVE_DATA_PATH="${TRAINING_DATA_DIR}/lars_modified_${MODEL_FAMILY}_${RETRIEVAL_TAG}_with_context"
+  SAVE_MODEL_PATH="${MODEL_OUTPUT_ROOT}/lars_modified_${RETRIEVAL_TAG}_with_context"
+  EXTRA_ARGS=(--lars-with-context --context-mode "$CONTEXT_MODE")
+else
+  echo "Unknown version: $VERSION"
+  exit 1
+fi
+
+echo "Dataset=${DATASET} Model=${MODEL_FAMILY} Retrieval=${RETRIEVAL} Version=${VERSION} Save=${SAVE_MODEL_PATH}"
+
+srun \
+  --container-image="${CONTAINER_IMAGE}" \
+  --container-workdir="$(pwd)" \
+  --container-mounts="${SCRATCH_ROOT}:${SCRATCH_ROOT},$(pwd):$(pwd),${FSCRATCH_ROOT}:${FSCRATCH_ROOT}" \
+  bash -c "
+    set -e
+    bash ${INSTALL_SCRIPT}
+    cd src
+    python3 train_lars.py \
+      --lars-version ${VERSION} \
+      --datasets ${DATASET} \
+      --size-for-each-dataset ${SIZE} \
+      --val-ratio ${VAL_RATIO} \
+      --seed ${SEED} \
+      --chat-model-name ${CHAT_MODEL} \
+      --dataset-path ${DATASET_PATH} \
+      --dataset-csv ${DATASET_CSV} \
+      --retrieval-file ${RETRIEVAL_FILE} \
+      --image-directory ${IMAGE_DIR} \
+      --kb-path ${EVQA_KB_PATH} \
+      --save-data-path ${SAVE_DATA_PATH} \
+      --save-model-path ${SAVE_MODEL_PATH} \
+      ${EXTRA_ARGS[*]}
+  "
+EOF
