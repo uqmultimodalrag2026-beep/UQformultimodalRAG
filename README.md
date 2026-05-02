@@ -10,7 +10,7 @@ This fork contains the code for the paper:
 
 LeMUQ estimates uncertainty for multimodal retrieval augmented generation by comparing how a VLM's token probabilities change under different conditioning settings. A VLM first receives a query, image, and retrieved context, then generates an answer with token probabilities. LeMUQ re-evaluates the same response after removing the image, the retrieved context, and both. These probability sequences are discretized into quantile bins and concatenated with the query, context, and generated tokens. A finetuned RoBERTa-based LeMUQ model then outputs a scalar confidence score for the generated response.
 
-![Overview of the LeMUQ pipeline](main.pdf)
+![Overview of the LeMUQ pipeline](main.png)
 
 **Figure 1:** Overview of the LeMUQ pipeline. A VLM generates a response from the query, input image, and retrieved context. The response is re-evaluated under multiple conditioning settings to expose different uncertainty sources, and the resulting mapped token probabilities are passed to a finetuned LeMUQ model that estimates response confidence.
 
