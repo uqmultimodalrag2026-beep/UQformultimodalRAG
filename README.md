@@ -37,6 +37,8 @@ The main modifications are:
 
 The script supports loading VLMs, datasets, context/retrieval modes, and configured truth methods through command-line arguments.
 
+**Only the truth methods described in this repository or in the associated paper have been verified. Currently, only local generation via Hugging Face is supported.**
+
 ### Training LeMUQ and VLM LARS Models
 
 [train_lars.py](src/train_lars.py) can be used to finetune LARS adapted for VLM models and to train LeMUQ models.
